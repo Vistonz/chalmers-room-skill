@@ -1,11 +1,27 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urljoin
 
 from playwright.sync_api import BrowserContext, Page, Response, sync_playwright
+
+from .booking import (
+    BookingDataError,
+    BookingPlan,
+    BookingRequest,
+    AvailabilitySlot,
+    ExistingBooking,
+    build_submission_form,
+    parse_availability_html,
+    parse_bookings_csv,
+    parse_reservation_id,
+    validate_booking_plan,
+    week_url_for_date,
+)
 
 
 BOOKING_URL = (
@@ -34,6 +50,19 @@ class CaptureResult:
     text: str
     html: str
     responses: list[CapturedResponse]
+
+
+@dataclass
+class BookingResult:
+    plan: BookingPlan
+    submitted: bool
+    reservation_id: str | None = None
+    after_bookings: list[ExistingBooking] | None = None
+    post_booking_error: str | None = None
+
+
+class BookingSubmissionError(RuntimeError):
+    """The one allowed booking submission did not return a reservation ID."""
 
 
 def default_state_dir() -> Path:
@@ -267,6 +296,186 @@ def assisted_booking(
         html=str(result.get("html", "")),
         responses=responses,
     )
+
+
+def _read_existing_bookings(
+    page: Page,
+    context: BrowserContext,
+    timeout_ms: int,
+) -> list[ExistingBooking]:
+    page.goto(MY_BOOKINGS_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+    try:
+        page.wait_for_selector(
+            'a[title="CSV"]',
+            state="attached",
+            timeout=timeout_ms,
+        )
+        href = page.locator('a[title="CSV"]').first.get_attribute("href")
+    except Exception as exc:
+        raise BookingDataError("无法读取现有预订，已停止以避免超限。") from exc
+    if not href:
+        raise BookingDataError("找不到预订数据下载链接，已停止以避免超限。")
+
+    csv_url = urljoin(page.url, href)
+    response = context.request.get(csv_url, timeout=timeout_ms)
+    if not response.ok:
+        raise BookingDataError(
+            f"读取现有预订失败（HTTP {response.status}），已停止以避免超限。"
+        )
+    try:
+        csv_text = response.body().decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise BookingDataError("现有预订数据编码无法识别，已停止以避免超限。") from exc
+    return parse_bookings_csv(csv_text)
+
+
+def _read_availability(
+    page: Page,
+    request: BookingRequest,
+    *,
+    settle_ms: int,
+    timeout_ms: int,
+) -> list[AvailabilitySlot]:
+    target_url = week_url_for_date(BOOKING_URL, request.booking_date)
+    page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+    try:
+        page.wait_for_selector("#reserveformedit", state="attached", timeout=timeout_ms)
+        page.wait_for_selector(
+            ".resobjectselector",
+            state="attached",
+            timeout=timeout_ms,
+        )
+    except Exception as exc:
+        raise BookingDataError("无法读取房间空档，已停止以避免误订。") from exc
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=settle_ms)
+    except Exception:
+        pass
+    page.wait_for_timeout(min(settle_ms, 2_000))
+    return parse_availability_html(page.content(), room_id=request.room_id)
+
+
+def _request_csrf_token(
+    context: BrowserContext,
+    page_url: str,
+    timeout_ms: int,
+) -> str:
+    response = context.request.post(
+        page_url,
+        form={"CSTTG": "gen"},
+        timeout=timeout_ms,
+    )
+    if not response.ok:
+        raise BookingSubmissionError(
+            f"提交前的安全检查失败（HTTP {response.status}），未发送预订。"
+        )
+    token = response.text().strip()
+    if not re.fullmatch(r"\d+", token):
+        raise BookingSubmissionError("提交前的安全令牌无法识别，未发送预订。")
+    return token
+
+
+def _submit_booking_once(
+    context: BrowserContext,
+    page_url: str,
+    request: BookingRequest,
+    timeout_ms: int,
+) -> tuple[str, str]:
+    token = _request_csrf_token(context, page_url, timeout_ms)
+    form = build_submission_form(request, page_url)
+    form["CSTT"] = token
+    response = context.request.post(
+        page_url,
+        form=form,
+        timeout=timeout_ms,
+    )
+    try:
+        body = response.text()
+    except Exception as exc:
+        raise BookingSubmissionError(
+            f"预订请求返回 HTTP {response.status}，但响应无法读取；未重试。"
+        ) from exc
+    if not response.ok:
+        raise BookingSubmissionError(
+            f"预订请求返回 HTTP {response.status}，未重试。"
+        )
+    reservation_id = parse_reservation_id(body)
+    if not reservation_id:
+        raise BookingSubmissionError(
+            "预订请求没有返回确认编号；为避免重复预订，未重试。"
+        )
+    return reservation_id, body
+
+
+def book_room(
+    request: BookingRequest,
+    *,
+    state_file: Path,
+    submit: bool,
+    headless: bool,
+    settle_ms: int = 5_000,
+    timeout_ms: int = 30_000,
+    on_plan: Callable[[BookingPlan], None] | None = None,
+) -> BookingResult:
+    result: dict[str, object] = {}
+
+    def run(page: Page, context: BrowserContext) -> None:
+        _select_student(page, timeout_ms)
+        existing_bookings = _read_existing_bookings(page, context, timeout_ms)
+        availability = _read_availability(
+            page,
+            request,
+            settle_ms=settle_ms,
+            timeout_ms=timeout_ms,
+        )
+        validate_booking_plan(request, existing_bookings, availability)
+        plan = BookingPlan(
+            request=request,
+            existing_bookings=existing_bookings,
+            availability=availability,
+        )
+        if on_plan is not None:
+            on_plan(plan)
+        if not submit:
+            result["booking_result"] = BookingResult(plan=plan, submitted=False)
+            return
+
+        page_url = page.url.split("#", 1)[0]
+        reservation_id, _ = _submit_booking_once(
+            context,
+            page_url,
+            request,
+            timeout_ms,
+        )
+
+        after_bookings: list[ExistingBooking] | None = None
+        post_booking_error: str | None = None
+        try:
+            after_bookings = _read_existing_bookings(page, context, timeout_ms)
+        except Exception:
+            post_booking_error = (
+                "预订请求已返回确认编号，但提交后无法重新读取预订列表。"
+            )
+        result["booking_result"] = BookingResult(
+            plan=plan,
+            submitted=True,
+            reservation_id=reservation_id,
+            after_bookings=after_bookings,
+            post_booking_error=post_booking_error,
+        )
+
+    open_page(
+        MY_BOOKINGS_URL,
+        headless=headless,
+        state_file=state_file,
+        on_page=run,
+        timeout_ms=timeout_ms,
+    )
+    booking_result = result.get("booking_result")
+    if not isinstance(booking_result, BookingResult):
+        raise BookingDataError("预订流程没有完成，未提交。")
+    return booking_result
 
 
 def session_info(

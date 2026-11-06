@@ -6,6 +6,12 @@ from datetime import datetime
 from pathlib import Path
 
 from . import browser
+from .booking import (
+    BookingError,
+    BookingPlan,
+    ExistingBooking,
+    create_booking_request,
+)
 
 
 def _state_dir(value: str | None) -> Path:
@@ -60,33 +66,88 @@ def command_rooms(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_booking(booking: ExistingBooking) -> str:
+    room = booking.room_name or booking.room_id or "未知房间"
+    title = booking.title or "未命名"
+    return (
+        f"- {booking.start:%Y-%m-%d %H:%M}-{booking.end:%H:%M} "
+        f"{room}（{title}）"
+    )
+
+
+def _print_booking_plan(plan: BookingPlan) -> None:
+    request = plan.request
+    weekdays = "一二三四五六日"
+    weekday = weekdays[request.booking_date.weekday()]
+    hours, remainder = divmod(request.duration_minutes, 60)
+    duration = f"{hours} 小时" if hours else ""
+    if remainder:
+        duration += f" {remainder} 分钟"
+
+    print("\n预订前检查通过")
+    print("=" * 48)
+    print(f"房间：{request.room_name}（{request.room_id}）")
+    print(
+        f"日期：{request.booking_date:%Y-%m-%d}（周{weekday}）"
+    )
+    print(f"时间：{request.start:%H:%M}-{request.end:%H:%M}（{duration.strip()}）")
+    print(f"用途：{request.title}")
+    print(f"现有有效预订：{len(plan.existing_bookings)} 条")
+    for booking in plan.existing_bookings:
+        print(_format_booking(booking))
+    print("=" * 48)
+
+
 def command_book(args: argparse.Namespace) -> int:
     state_dir = _state_dir(args.state_dir)
+    try:
+        request = create_booking_request(
+            date_text=args.date,
+            start_text=args.start,
+            end_text=args.end,
+            room_name=args.room,
+            room_id=args.room_id,
+            title=args.message,
+        )
+        result = browser.book_room(
+            request,
+            state_file=browser.auth_state_path(state_dir),
+            submit=args.yes,
+            headless=args.headless,
+            settle_ms=args.settle_ms,
+            timeout_ms=args.timeout_ms,
+            on_plan=_print_booking_plan,
+        )
+    except (BookingError, browser.BookingSubmissionError) as exc:
+        print(f"预订未完成：{exc}", file=sys.stderr)
+        return 2
 
-    # Always capture existing bookings before assisting a new reservation.
-    before = browser.capture(
-        url=browser.MY_BOOKINGS_URL,
-        state_file=browser.auth_state_path(state_dir),
-        headless=args.headless,
-        settle_ms=args.settle_ms,
-        timeout_ms=args.timeout_ms,
-    )
-    before_path = _save(before, "bookings-before", state_dir)
-    print(f"Saved pre-booking bookings data: {before_path}")
+    if not result.submitted:
+        print("\n这是预览，尚未提交。")
+        print("确认房间、日期和时间无误后，在命令末尾添加 --yes 才会真正预订。")
+        return 0
 
-    print("\nPlease review your existing bookings in the browser before continuing.")
-    print("Chalmers library group rooms allow at most 4 bookings of 4 hours in 4 weeks.")
-    input("Press Enter to open the booking page... ")
+    print(f"\n预订请求已提交，确认编号：{result.reservation_id}")
+    if result.post_booking_error:
+        print(f"注意：{result.post_booking_error}")
+        print("请不要重复提交，稍后运行 `chalmers-room bookings` 核对。")
+        return 0
 
-    after = browser.assisted_booking(
-        state_file=browser.auth_state_path(state_dir),
-        url=args.url,
-        timeout_ms=args.timeout_ms,
-    )
-    after_path = _save(after, "booking-after", state_dir)
-    print(f"Saved post-booking data: {after_path}")
-    print("\nConfirmation page text:\n")
-    print(after.text)
+    after = result.after_bookings or []
+    print(f"提交后重新读取到 {len(after)} 条有效预订。")
+    for booking in after:
+        print(_format_booking(booking))
+    matching = [
+        booking
+        for booking in after
+        if booking.room_id == request.room_id
+        and booking.start == request.start_at
+        and booking.end == request.end_at
+    ]
+    if matching:
+        print("新预订已在预订列表中确认。")
+    else:
+        print("提交已获确认，但列表中暂未出现完全匹配项；请稍后运行 bookings 核对。")
     return 0
 
 
@@ -111,7 +172,7 @@ def command_session(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="chalmers-room",
-        description="Session-based helper for Chalmers library group-room bookings",
+        description="Automated Chalmers library group-room booking helper",
     )
     parser.add_argument(
         "--state-dir",
@@ -143,9 +204,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     book = subparsers.add_parser(
         "book",
-        help="capture existing bookings, then open an assisted booking page",
+        help="validate and automatically submit one room reservation",
     )
-    book.add_argument("--url", default=browser.BOOKING_URL)
+    book.add_argument("--date", required=True, help="booking date in YYYY-MM-DD format")
+    book.add_argument("--start", required=True, help="start time in HH:MM format")
+    book.add_argument("--end", required=True, help="end time in HH:MM format")
+    room = book.add_mutually_exclusive_group(required=True)
+    room.add_argument("--room", help="room name, for example BIB-G134C")
+    room.add_argument("--room-id", help="TimeEdit room ID, for example 18836.4")
+    book.add_argument("--message", required=True, help="booking title")
+    book.add_argument(
+        "--yes",
+        action="store_true",
+        help="submit the booking; without this flag the command only previews",
+    )
     book.add_argument("--headless", action="store_true")
     book.add_argument("--settle-ms", type=int, default=5_000)
     book.add_argument("--timeout-ms", type=int, default=30_000)
