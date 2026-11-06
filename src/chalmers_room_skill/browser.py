@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urljoin
@@ -13,9 +14,11 @@ from .booking import (
     BookingDataError,
     BookingPlan,
     BookingRequest,
+    BookingSource,
     AvailabilitySlot,
     ExistingBooking,
     build_submission_form,
+    get_booking_source,
     parse_availability_html,
     parse_bookings_csv,
     parse_reservation_id,
@@ -24,13 +27,7 @@ from .booking import (
 )
 
 
-BOOKING_URL = (
-    "https://cloud.timeedit.net/chalmers/web/student/ri.html"
-    "?exw=t&fe=0&h=t&objects=699.4%2C18834.4%2C18836.4%2C18837.4"
-    "%2C18838.4%2C18839.4%2C18842.4%2C18843.4%2C18844.4%2C18845.4"
-    "%2C18846.4%2C18847.4%2C697.4%2C698.4%2C696.4%2C444.4%2C"
-    "&ox=0&part=f&rr=1&se=f&sid=5&tg=-1&type=room&types=0"
-)
+BOOKING_URL = get_booking_source("library").booking_url
 MY_BOOKINGS_URL = "https://cloud.timeedit.net/chalmers/web/student/my.html"
 ORGANIZATION_URL = "https://cloud.timeedit.net/chalmers/web/"
 
@@ -59,6 +56,27 @@ class BookingResult:
     reservation_id: str | None = None
     after_bookings: list[ExistingBooking] | None = None
     post_booking_error: str | None = None
+
+
+@dataclass(frozen=True)
+class AvailabilityCandidate:
+    booking_date: date
+    room_id: str
+    room_name: str
+    start_minute: int
+    end_minute: int
+
+    @property
+    def start_at(self) -> datetime:
+        return datetime.combine(self.booking_date, time.min) + timedelta(
+            minutes=self.start_minute
+        )
+
+    @property
+    def end_at(self) -> datetime:
+        return datetime.combine(self.booking_date, time.min) + timedelta(
+            minutes=self.end_minute
+        )
 
 
 class BookingSubmissionError(RuntimeError):
@@ -331,12 +349,14 @@ def _read_existing_bookings(
 
 def _read_availability(
     page: Page,
-    request: BookingRequest,
+    booking_date: date,
+    source: BookingSource,
     *,
+    room_id: str | None = None,
     settle_ms: int,
     timeout_ms: int,
 ) -> list[AvailabilitySlot]:
-    target_url = week_url_for_date(BOOKING_URL, request.booking_date)
+    target_url = week_url_for_date(source.booking_url, booking_date)
     page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
     try:
         page.wait_for_selector("#reserveformedit", state="attached", timeout=timeout_ms)
@@ -353,7 +373,125 @@ def _read_availability(
     except Exception:
         pass
     page.wait_for_timeout(min(settle_ms, 2_000))
-    return parse_availability_html(page.content(), room_id=request.room_id)
+    return parse_availability_html(
+        page.content(),
+        room_id=room_id,
+        location=source.key,
+    )
+
+
+def _next_increment(minute: int) -> int:
+    return ((minute + 14) // 15) * 15
+
+
+def _next_booking_start_minute(value: datetime) -> int:
+    minute = value.hour * 60 + value.minute + 1
+    return _next_increment(minute)
+
+
+def _candidate_from_slot(
+    slot: AvailabilitySlot,
+    *,
+    source: BookingSource,
+    start_after: datetime,
+    duration_minutes: int,
+) -> AvailabilityCandidate | None:
+    start_minute = slot.begin_minute
+    if slot.booking_date == start_after.date():
+        start_minute = max(start_minute, _next_booking_start_minute(start_after))
+
+    end_minute = start_minute + duration_minutes
+    latest_end = min(float(source.latest_end_minute), slot.end_minute)
+    if end_minute > latest_end:
+        return None
+
+    candidate = AvailabilityCandidate(
+        booking_date=slot.booking_date,
+        room_id=slot.room_id,
+        room_name=source.rooms_by_id.get(slot.room_id, slot.room_id),
+        start_minute=start_minute,
+        end_minute=end_minute,
+    )
+    if candidate.start_at <= start_after:
+        return None
+    return candidate
+
+
+def find_earliest_availability(
+    *,
+    location: str,
+    start_after: datetime,
+    duration_minutes: int,
+    horizon_days: int,
+    state_file: Path,
+    headless: bool,
+    settle_ms: int = 5_000,
+    timeout_ms: int = 30_000,
+) -> AvailabilityCandidate | None:
+    if duration_minutes < 30 or duration_minutes > 4 * 60:
+        raise BookingDataError("查询时长必须在 30 分钟到 4 小时之间。")
+    if duration_minutes % 15:
+        raise BookingDataError("查询时长必须按 15 分钟递增。")
+    if horizon_days < 0 or horizon_days > 14:
+        raise BookingDataError("查询范围必须在 0 到 14 天内。")
+
+    source = get_booking_source(location)
+    end_after = start_after + timedelta(days=horizon_days)
+    result: dict[str, AvailabilityCandidate | None] = {"candidate": None}
+
+    def run(page: Page, context: BrowserContext) -> None:
+        _select_student(page, timeout_ms)
+        first_date = start_after.date()
+        week_mondays = []
+        cursor = first_date
+        while cursor <= end_after.date():
+            monday = cursor - timedelta(days=cursor.weekday())
+            if monday not in week_mondays:
+                week_mondays.append(monday)
+            cursor += timedelta(days=1)
+
+        candidates: list[AvailabilityCandidate] = []
+        for monday in week_mondays:
+            slots = _read_availability(
+                page,
+                monday,
+                source,
+                settle_ms=settle_ms,
+                timeout_ms=timeout_ms,
+            )
+            for slot in slots:
+                candidate = _candidate_from_slot(
+                    slot,
+                    source=source,
+                    start_after=start_after,
+                    duration_minutes=duration_minutes,
+                )
+                if candidate is None:
+                    continue
+                if candidate.end_at > end_after:
+                    continue
+                candidates.append(candidate)
+            if candidates:
+                break
+
+        if candidates:
+            result["candidate"] = min(
+                candidates,
+                key=lambda candidate: (
+                    candidate.start_at,
+                    candidate.room_name,
+                    candidate.room_id,
+                ),
+            )
+
+    open_page(
+        MY_BOOKINGS_URL,
+        headless=headless,
+        state_file=state_file,
+        on_page=run,
+        timeout_ms=timeout_ms,
+    )
+    return result["candidate"]
 
 
 def _request_csrf_token(
@@ -422,14 +560,22 @@ def book_room(
 
     def run(page: Page, context: BrowserContext) -> None:
         _select_student(page, timeout_ms)
+        source = get_booking_source(request.source)
         existing_bookings = _read_existing_bookings(page, context, timeout_ms)
         availability = _read_availability(
             page,
-            request,
+            request.booking_date,
+            source,
+            room_id=request.room_id,
             settle_ms=settle_ms,
             timeout_ms=timeout_ms,
         )
-        validate_booking_plan(request, existing_bookings, availability)
+        validate_booking_plan(
+            request,
+            existing_bookings,
+            availability,
+            now=datetime.now(),
+        )
         plan = BookingPlan(
             request=request,
             existing_bookings=existing_bookings,

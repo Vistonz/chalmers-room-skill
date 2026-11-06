@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from datetime import date, time
+from datetime import date, datetime, time
 
-from chalmers_room_skill.booking import BookingRequest
-from chalmers_room_skill.browser import _submit_booking_once
+from chalmers_room_skill.booking import AvailabilitySlot, BookingRequest
+from chalmers_room_skill.browser import (
+    _candidate_from_slot,
+    _submit_booking_once,
+)
+from chalmers_room_skill.booking import get_booking_source
 
 
 class FakeResponse:
@@ -53,3 +57,39 @@ def test_submit_booking_posts_booking_exactly_once() -> None:
     assert booking_form["kind"] == "reserve"
     assert booking_form["CSTT"] == "123456789"
     assert booking_form["o"] == "18836.4"
+
+
+def test_earliest_candidate_rounds_forward_and_respects_duration() -> None:
+    source = get_booking_source("ed")
+    candidate = _candidate_from_slot(
+        AvailabilitySlot(
+            booking_date=date(2026, 11, 6),
+            room_id="501.4",
+            begin_minute=18 * 60,
+            end_minute=20 * 60,
+        ),
+        source=source,
+        start_after=datetime(2026, 11, 6, 18, 47, 3),
+        duration_minutes=60,
+    )
+
+    assert candidate is not None
+    assert candidate.room_name == "EG-3207A"
+    assert candidate.start_at == datetime(2026, 11, 6, 19, 0)
+    assert candidate.end_at == datetime(2026, 11, 6, 20, 0)
+
+
+def test_candidate_rejects_slot_that_is_too_short() -> None:
+    candidate = _candidate_from_slot(
+        AvailabilitySlot(
+            booking_date=date(2026, 11, 6),
+            room_id="501.4",
+            begin_minute=18 * 60,
+            end_minute=18 * 60 + 45,
+        ),
+        source=get_booking_source("ed"),
+        start_after=datetime(2026, 11, 6, 18, 47, 3),
+        duration_minutes=60,
+    )
+
+    assert candidate is None

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "chalmers-room-skill"
 version = "0.2.0"
-description = "An automated browser-session helper for Chalmers library group-room bookings"
+description = "An automated browser-session helper for Chalmers group-room bookings"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

@@ -14,6 +14,7 @@ from chalmers_room_skill.booking import (
     parse_availability_html,
     parse_bookings_csv,
     parse_reservation_id,
+    resolve_room,
     validate_booking_plan,
     week_url_for_date,
 )
@@ -83,6 +84,70 @@ def test_adjacent_availability_slots_are_merged() -> None:
     validate_booking_plan(request, [], availability)
 
 
+def test_resolve_ed_room_uses_ed_source() -> None:
+    assert resolve_room(location="ed", room_name="EG-3207A") == (
+        "EG-3207A",
+        "501.4",
+    )
+    assert resolve_room(location="ed", room_id="574.4") == (
+        "EG-4205A",
+        "574.4",
+    )
+
+
+def test_ed_booking_can_end_at_midnight() -> None:
+    request = create_booking_request(
+        date_text="2026-11-10",
+        start_text="23:00",
+        end_text="24:00",
+        room_name="EG-3207A",
+        room_id=None,
+        title="Grupparbete",
+        location="ed",
+    )
+
+    assert request.source == "ed"
+    assert request.end_minute == 24 * 60
+    assert request.end_at == datetime(2026, 11, 11, 0, 0)
+    assert build_submission_form(request, "https://example.test/ri.html")["endtime"] == (
+        "24:00"
+    )
+
+
+def test_ed_rolling_two_week_limit_fails_closed() -> None:
+    request = create_booking_request(
+        date_text="2026-11-10",
+        start_text="10:00",
+        end_text="11:00",
+        room_name="EG-3207A",
+        room_id=None,
+        title="Grupparbete",
+        location="ed",
+    )
+    existing = [
+        ExistingBooking(
+            title=f"Bokning {day}",
+            room_name="EG-3207A",
+            room_id="501.4",
+            start=datetime(2026, 11, day, 8, 0),
+            end=datetime(2026, 11, day, 9, 0),
+            status="Reserverad",
+        )
+        for day in (1, 2, 3, 4)
+    ]
+    availability = [
+        AvailabilitySlot(
+            booking_date=request.booking_date,
+            room_id=request.room_id,
+            begin_minute=8 * 60,
+            end_minute=18 * 60,
+        )
+    ]
+
+    with pytest.raises(BookingError, match="滚动 14 天"):
+        validate_booking_plan(request, existing, availability)
+
+
 def test_parse_availability_from_timeedit_markup() -> None:
     html = """
     <div class="slotfree2 slotfreetarget"
@@ -99,6 +164,43 @@ def test_parse_availability_from_timeedit_markup() -> None:
     assert slots[0].booking_date == date(2026, 11, 10)
     assert slots[0].begin_minute == 480
     assert slots[0].end_minute == pytest.approx(600)
+
+
+def test_parse_ed_availability_subtracts_booked_rows() -> None:
+    html = """
+    <div class="weekDay" data-day="20261107">
+      <div class="weekDiv">
+        <a class="boxlink hour" onclick="return openObject(501.4, this, 't')">
+          <div class="objbase">EG-3207A</div>
+        </a>
+        <a class="boxlink hour" onclick="return openObject(502.4, this, 't')">
+          <div class="objbase">EG-3207B</div>
+        </a>
+      </div>
+      <div class="slotfree2 slotfreetarget"
+           data-resminheight="40"
+           data-dates="20261107"
+           data-beginminute="480"
+           data-object="501.4"></div>
+      <div class="bookingDiv"
+           style="top: 0px; left: 0%; width: 50%; height: 40px;"
+           title=" 2026-11-07 08:00 - 12:00 Grupparbete"></div>
+      <div class="bookingDiv"
+           style="top: 40px; left: 0%; width: 25%; height: 40px;"
+           title=" 2026-11-07 08:00 - 10:00 Möte"></div>
+    </div>
+    """
+
+    slots = parse_availability_html(html, location="ed")
+
+    room_a = [slot for slot in slots if slot.room_id == "501.4"]
+    room_b = [slot for slot in slots if slot.room_id == "502.4"]
+    assert [(slot.begin_minute, slot.end_minute) for slot in room_a] == [
+        (12 * 60, 24 * 60)
+    ]
+    assert [(slot.begin_minute, slot.end_minute) for slot in room_b] == [
+        (10 * 60, 24 * 60)
+    ]
 
 
 def test_parse_bookings_csv_ignores_cancelled_rows() -> None:

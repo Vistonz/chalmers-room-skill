@@ -11,6 +11,7 @@ from .booking import (
     BookingPlan,
     ExistingBooking,
     create_booking_request,
+    get_booking_source,
 )
 
 
@@ -52,8 +53,9 @@ def command_bookings(args: argparse.Namespace) -> int:
 
 
 def command_rooms(args: argparse.Namespace) -> int:
+    url = args.url or get_booking_source(args.location).booking_url
     result = browser.capture(
-        url=args.url,
+        url=url,
         state_file=browser.auth_state_path(_state_dir(args.state_dir)),
         headless=args.headless,
         settle_ms=args.settle_ms,
@@ -63,6 +65,39 @@ def command_rooms(args: argparse.Namespace) -> int:
     print(f"Saved room availability data: {path}")
     print("\nPage text:\n")
     print(result.text)
+    return 0
+
+
+def command_availability(args: argparse.Namespace) -> int:
+    start_after = (
+        datetime.fromisoformat(args.start_after)
+        if args.start_after
+        else datetime.now()
+    )
+    try:
+        candidate = browser.find_earliest_availability(
+            location=args.location,
+            start_after=start_after,
+            duration_minutes=args.duration_minutes,
+            horizon_days=args.horizon_days,
+            state_file=browser.auth_state_path(_state_dir(args.state_dir)),
+            headless=args.headless,
+            settle_ms=args.settle_ms,
+            timeout_ms=args.timeout_ms,
+        )
+    except (BookingError, browser.BookingDataError) as exc:
+        print(f"查询未完成：{exc}", file=sys.stderr)
+        return 2
+
+    if candidate is None:
+        print("查询范围内没有找到符合条件的小组会议室空档。")
+        return 0
+
+    source = get_booking_source(args.location)
+    print(f"地点：{source.label}")
+    print(f"房间：{candidate.room_name}（{candidate.room_id}）")
+    print(f"时间：{candidate.start_at:%Y-%m-%d %H:%M}-{candidate.end_at:%H:%M}")
+    print(f"时长：{args.duration_minutes} 分钟")
     return 0
 
 
@@ -90,7 +125,7 @@ def _print_booking_plan(plan: BookingPlan) -> None:
     print(
         f"日期：{request.booking_date:%Y-%m-%d}（周{weekday}）"
     )
-    print(f"时间：{request.start:%H:%M}-{request.end:%H:%M}（{duration.strip()}）")
+    print(f"时间：{request.start:%H:%M}-{request.end_text}（{duration.strip()}）")
     print(f"用途：{request.title}")
     print(f"现有有效预订：{len(plan.existing_bookings)} 条")
     for booking in plan.existing_bookings:
@@ -108,6 +143,7 @@ def command_book(args: argparse.Namespace) -> int:
             room_name=args.room,
             room_id=args.room_id,
             title=args.message,
+            location=args.location,
         )
         result = browser.book_room(
             request,
@@ -172,7 +208,7 @@ def command_session(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="chalmers-room",
-        description="Automated Chalmers library group-room booking helper",
+        description="Automated Chalmers group-room booking helper",
     )
     parser.add_argument(
         "--state-dir",
@@ -196,22 +232,40 @@ def build_parser() -> argparse.ArgumentParser:
     bookings.set_defaults(handler=command_bookings)
 
     rooms = subparsers.add_parser("rooms", help="capture current room availability")
-    rooms.add_argument("--url", default=browser.BOOKING_URL)
+    rooms.add_argument("--location", choices=("library", "ed"), default="library")
+    rooms.add_argument("--url")
     rooms.add_argument("--headless", action="store_true")
     rooms.add_argument("--settle-ms", type=int, default=5_000)
     rooms.add_argument("--timeout-ms", type=int, default=30_000)
     rooms.set_defaults(handler=command_rooms)
 
+    availability = subparsers.add_parser(
+        "availability",
+        help="find the earliest available room for a requested duration",
+    )
+    availability.add_argument("--location", choices=("library", "ed"), default="ed")
+    availability.add_argument("--duration-minutes", type=int, default=60)
+    availability.add_argument("--horizon-days", type=int, default=2)
+    availability.add_argument(
+        "--start-after",
+        help="search after this local datetime in ISO format; defaults to now",
+    )
+    availability.add_argument("--headless", action="store_true")
+    availability.add_argument("--settle-ms", type=int, default=5_000)
+    availability.add_argument("--timeout-ms", type=int, default=30_000)
+    availability.set_defaults(handler=command_availability)
+
     book = subparsers.add_parser(
         "book",
         help="validate and automatically submit one room reservation",
     )
+    book.add_argument("--location", choices=("library", "ed"), default="library")
     book.add_argument("--date", required=True, help="booking date in YYYY-MM-DD format")
     book.add_argument("--start", required=True, help="start time in HH:MM format")
     book.add_argument("--end", required=True, help="end time in HH:MM format")
     room = book.add_mutually_exclusive_group(required=True)
-    room.add_argument("--room", help="room name, for example BIB-G134C")
-    room.add_argument("--room-id", help="TimeEdit room ID, for example 18836.4")
+    room.add_argument("--room", help="room name, for example EG-3207A")
+    room.add_argument("--room-id", help="TimeEdit room ID, for example 501.4")
     book.add_argument("--message", required=True, help="booking title")
     book.add_argument(
         "--yes",
