@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chalmers-room-skill"
+version = "0.1.0"
+description = "A browser-session based helper for Chalmers library group-room bookings"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "playwright>=1.49",
+]
+license = { text = "MIT" }
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]
+
+[project.scripts]
+chalmers-room = "chalmers_room_skill.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
